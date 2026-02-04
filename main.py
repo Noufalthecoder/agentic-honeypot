@@ -95,13 +95,8 @@ def analyze_scam_intent(text: str, extracted_data: Dict[str, list]) -> tuple[boo
         
     return is_scam, round(confidence, 2)
 
-# --- Endpoints ---
-
-@app.post("/honeypot", response_model=HoneypotResponse)
-async def honeypot_endpoint(
-    request: Request,
-    api_key: str = Depends(validate_api_key)
-):
+async def _process_request(request: Request) -> HoneypotResponse:
+    """Shared logic for processing requests from any endpoint."""
     # Parse body manually to handle missing/empty body without 422
     try:
         body = await request.json()
@@ -135,6 +130,23 @@ async def honeypot_endpoint(
         confidence=confidence,
         status="analysis_complete"
     )
+
+# --- Endpoints ---
+
+@app.post("/honeypot", response_model=HoneypotResponse)
+async def honeypot_endpoint(
+    request: Request,
+    api_key: str = Depends(validate_api_key)
+):
+    return await _process_request(request)
+
+@app.post("/", response_model=HoneypotResponse)
+async def root_endpoint(
+    request: Request,
+    api_key: str = Depends(validate_api_key)
+):
+    """Fallback endpoint for testers that hit root instead of /honeypot"""
+    return await _process_request(request)
 
 if __name__ == "__main__":
     import uvicorn
