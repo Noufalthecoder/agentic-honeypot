@@ -12,7 +12,7 @@ API_KEY_NAME = "x-api-key"
 # --- Models ---
 
 class HoneypotRequest(BaseModel):
-    message: str
+    message: Optional[str] = ""
     conversation_id: Optional[str] = None
 
 class ExtractedData(BaseModel):
@@ -110,9 +110,12 @@ def analyze_scam_intent(text: str, extracted_data: Dict[str, list]) -> tuple[boo
 
 @app.post("/honeypot", response_model=HoneypotResponse)
 async def honeypot_endpoint(
-    request: HoneypotRequest, 
+    request: Optional[HoneypotRequest] = None, 
     api_key: str = Depends(validate_api_key)
 ):
+    if request is None:
+        request = HoneypotRequest(message="")
+
     extracted = extract_intelligence(request.message)
     is_scam, confidence = analyze_scam_intent(request.message, extracted)
     
