@@ -1,5 +1,5 @@
 import re
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Header, HTTPException, status, Depends, Request
 from pydantic import BaseModel
 from json import JSONDecodeError
@@ -8,10 +8,9 @@ app = FastAPI(title="Agentic Honeypot API")
 
 # --- Configuration ---
 API_KEY_VALUE = "AIIHB-2026-SECRET"
-API_KEY_NAME = "x-api-key"
 
 # --- Models ---
-
+# Defined for response documentation, even if we build dicts manually
 class ExtractedData(BaseModel):
     upi_ids: List[str]
     bank_accounts: List[str]
@@ -29,7 +28,7 @@ class HoneypotResponse(BaseModel):
 # --- Logic ---
 
 def validate_api_key(x_api_key: str = Header(..., alias="x-api-key")):
-    """Validates the x-api-key header."""
+    """Validates the x-api-key header. Throws 401 if invalid."""
     if x_api_key != API_KEY_VALUE:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -39,12 +38,14 @@ def validate_api_key(x_api_key: str = Header(..., alias="x-api-key")):
 
 def extract_intelligence(text: str) -> Dict[str, list]:
     """Extracts UPIs, bank accounts, and URLs from the text using Regex."""
-    
+    if not text:
+        return {"upi_ids": [], "bank_accounts": [], "phishing_links": []}
+
     # UPI ID Regex
     upi_pattern = r'[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}'
     upi_ids = list(set(re.findall(upi_pattern, text)))
 
-    # Bank Account Regex: 9 to 18 digits. 
+    # Bank Account Regex: 9 to 18 digits.
     bank_account_pattern = r'\b\d{9,18}\b'
     bank_accounts = list(set(re.findall(bank_account_pattern, text)))
 
@@ -59,13 +60,13 @@ def extract_intelligence(text: str) -> Dict[str, list]:
     }
 
 def analyze_scam_intent(text: str, extracted_data: Dict[str, list]) -> tuple[bool, float]:
-    """
-    Detects scam intent based on keywords and presence of suspicious data.
-    Returns (is_scam, confidence).
-    """
+    """Returns (is_scam, confidence)."""
+    if not text or not text.strip():
+        return False, 0.0
+
     text_lower = text.lower()
     
-    # Keywords often found in scam messages
+    # Keywords
     scam_keywords = [
         "urgent", "winner", "lottery", "congratulations", "won", "prize",
         "verify", "kyc", "blocked", "account", "expire", "otp", "password",
@@ -74,49 +75,59 @@ def analyze_scam_intent(text: str, extracted_data: Dict[str, list]) -> tuple[boo
     ]
     
     keyword_hits = sum(1 for word in scam_keywords if word in text_lower)
-    
-    # Simple heuristics for confidence
     score = 0.0
     
     if keyword_hits > 0:
         score += 0.3 + (min(keyword_hits, 5) * 0.1)
     
-    if extracted_data["phishing_links"]:
+    if extracted_data.get("phishing_links"):
         score += 0.4
-    if extracted_data["upi_ids"] or extracted_data["bank_accounts"]:
+    if extracted_data.get("upi_ids") or extracted_data.get("bank_accounts"):
         score += 0.3
         
     confidence = min(score, 1.0)
     is_scam = confidence > 0.4
     
-    if not text.strip():
-        confidence = 0.0
-        is_scam = False
-        
     return is_scam, round(confidence, 2)
 
-async def _process_request(request: Request) -> HoneypotResponse:
-    """Shared logic for processing requests from any endpoint."""
-    # Parse body manually to handle missing/empty body without 422
-    try:
-        body = await request.json()
-    except (JSONDecodeError, Exception):
-        # If parsing fails (e.g. empty body, invalid JSON), treat as empty input
-        body = {}
-    
-    # Safely extract fields with defaults
-    message = body.get("message", "")
-    if not isinstance(message, str):
-        message = str(message) if message is not None else ""
-        
-    conversation_id = body.get("conversation_id")
-    if conversation_id is not None and not isinstance(conversation_id, str):
-        conversation_id = str(conversation_id)
+# --- Universal Handler ---
 
-    # Core logic
+async def universal_handler(request: Request, api_key: str = Depends(validate_api_key)):
+    """
+    Handles GET and POST for / and /honeypot.
+    Returns 200 OK with proper JSON structure even if body is missing.
+    """
+    
+    # Default / Tester values
+    message = ""
+    conversation_id = None
+    status_text = "tester_ok"
+    
+    # Try to parse body if POST
+    if request.method == "POST":
+        try:
+            # We assume JSON if body exists. Silent fail if not.
+            # Using request.stream() or just json() inside try/except is safe
+            body = await request.json()
+            if isinstance(body, dict):
+                msg = body.get("message")
+                # Update message only if it's a non-empty string
+                if isinstance(msg, str) and msg.strip():
+                    message = msg
+                    status_text = "analysis_complete"
+                
+                cid = body.get("conversation_id")
+                if isinstance(cid, str):
+                    conversation_id = cid
+        except Exception:
+            # Parsing failed (empty body, wrong content-type, etc.)
+            # We stick to defaults -> equivalent to "tester_ok"
+            pass
+
+    # Run Logic (will be empty/safe if message is empty)
     extracted = extract_intelligence(message)
     is_scam, confidence = analyze_scam_intent(message, extracted)
-    
+
     return HoneypotResponse(
         is_scam=is_scam,
         conversation_id=conversation_id,
@@ -128,25 +139,14 @@ async def _process_request(request: Request) -> HoneypotResponse:
             phishing_links=extracted["phishing_links"]
         ),
         confidence=confidence,
-        status="analysis_complete"
+        status=status_text
     )
 
-# --- Endpoints ---
+# --- Routes ---
 
-@app.post("/honeypot", response_model=HoneypotResponse)
-async def honeypot_endpoint(
-    request: Request,
-    api_key: str = Depends(validate_api_key)
-):
-    return await _process_request(request)
-
-@app.post("/", response_model=HoneypotResponse)
-async def root_endpoint(
-    request: Request,
-    api_key: str = Depends(validate_api_key)
-):
-    """Fallback endpoint for testers that hit root instead of /honeypot"""
-    return await _process_request(request)
+# Register the same handler for all required paths and methods
+app.add_api_route("/", universal_handler, methods=["GET", "POST"], response_model=HoneypotResponse)
+app.add_api_route("/honeypot", universal_handler, methods=["GET", "POST"], response_model=HoneypotResponse)
 
 if __name__ == "__main__":
     import uvicorn
