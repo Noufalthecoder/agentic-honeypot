@@ -1,7 +1,8 @@
 import re
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, Header, HTTPException, status, Depends
-from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any, Union
+from fastapi import FastAPI, Header, HTTPException, status, Depends, Request
+from pydantic import BaseModel
+from json import JSONDecodeError
 
 app = FastAPI(title="Agentic Honeypot API")
 
@@ -10,10 +11,6 @@ API_KEY_VALUE = "AIIHB-2026-SECRET"
 API_KEY_NAME = "x-api-key"
 
 # --- Models ---
-
-class HoneypotRequest(BaseModel):
-    message: Optional[str] = ""
-    conversation_id: Optional[str] = None
 
 class ExtractedData(BaseModel):
     upi_ids: List[str]
@@ -43,21 +40,16 @@ def validate_api_key(x_api_key: str = Header(..., alias="x-api-key")):
 def extract_intelligence(text: str) -> Dict[str, list]:
     """Extracts UPIs, bank accounts, and URLs from the text using Regex."""
     
-    # UPI ID Regex: Matches standard UPI patterns (e.g., user@bank, phone@upi)
-    # Basic loose pattern to catch most handles
+    # UPI ID Regex
     upi_pattern = r'[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}'
     upi_ids = list(set(re.findall(upi_pattern, text)))
 
     # Bank Account Regex: 9 to 18 digits. 
-    # Using \b to ensure we don't cut numbers from larger strings, but simplistic enough.
-    # We filter out items that might look like phone numbers if they are strictly 10 digits starting with 6-9 usually,
-    # but requirement just says 9-18 digits, so we stick to that strictly.
     bank_account_pattern = r'\b\d{9,18}\b'
     bank_accounts = list(set(re.findall(bank_account_pattern, text)))
 
-    # Phishing URL Regex: Standard http/https URL extraction
+    # Phishing URL Regex
     url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[-\w._~:/?#[\]@!$&\'()*+,;=]*)?'
-    # Also simple www matches if needed, but sticking to http/s for safer "phishing" assumption
     phishing_links = list(set(re.findall(url_pattern, text)))
 
     return {
@@ -86,20 +78,17 @@ def analyze_scam_intent(text: str, extracted_data: Dict[str, list]) -> tuple[boo
     # Simple heuristics for confidence
     score = 0.0
     
-    # 1. Keyword presence
     if keyword_hits > 0:
-        score += 0.3 + (min(keyword_hits, 5) * 0.1) # Up to 0.8 from keywords
+        score += 0.3 + (min(keyword_hits, 5) * 0.1)
     
-    # 2. Presence of extracted entities (scams often ask to pay or click)
     if extracted_data["phishing_links"]:
         score += 0.4
     if extracted_data["upi_ids"] or extracted_data["bank_accounts"]:
         score += 0.3
         
     confidence = min(score, 1.0)
-    is_scam = confidence > 0.4 # Threshold
+    is_scam = confidence > 0.4
     
-    # Edge case: minimal text with no keywords or entities might just be low confidence
     if not text.strip():
         confidence = 0.0
         is_scam = False
@@ -110,20 +99,34 @@ def analyze_scam_intent(text: str, extracted_data: Dict[str, list]) -> tuple[boo
 
 @app.post("/honeypot", response_model=HoneypotResponse)
 async def honeypot_endpoint(
-    request: Optional[HoneypotRequest] = None, 
+    request: Request,
     api_key: str = Depends(validate_api_key)
 ):
-    if request is None:
-        request = HoneypotRequest(message="")
+    # Parse body manually to handle missing/empty body without 422
+    try:
+        body = await request.json()
+    except (JSONDecodeError, Exception):
+        # If parsing fails (e.g. empty body, invalid JSON), treat as empty input
+        body = {}
+    
+    # Safely extract fields with defaults
+    message = body.get("message", "")
+    if not isinstance(message, str):
+        message = str(message) if message is not None else ""
+        
+    conversation_id = body.get("conversation_id")
+    if conversation_id is not None and not isinstance(conversation_id, str):
+        conversation_id = str(conversation_id)
 
-    extracted = extract_intelligence(request.message)
-    is_scam, confidence = analyze_scam_intent(request.message, extracted)
+    # Core logic
+    extracted = extract_intelligence(message)
+    is_scam, confidence = analyze_scam_intent(message, extracted)
     
     return HoneypotResponse(
         is_scam=is_scam,
-        conversation_id=request.conversation_id,
-        engagement_active=True, # Assuming honeypot is active and listening
-        turns=1, # Hardcoded as requested to start with 1
+        conversation_id=conversation_id,
+        engagement_active=True,
+        turns=1,
         extracted_data=ExtractedData(
             upi_ids=extracted["upi_ids"],
             bank_accounts=extracted["bank_accounts"],
@@ -135,5 +138,4 @@ async def honeypot_endpoint(
 
 if __name__ == "__main__":
     import uvicorn
-    # Local development run
     uvicorn.run(app, host="127.0.0.1", port=8000)
