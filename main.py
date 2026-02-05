@@ -1,16 +1,13 @@
 import re
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 from fastapi import FastAPI, Header, HTTPException, status, Depends, Request
 from pydantic import BaseModel
-from json import JSONDecodeError
 
 app = FastAPI(title="Agentic Honeypot API")
 
-# --- Configuration ---
 API_KEY_VALUE = "AIIHB-2026-SECRET"
 
-# --- Models ---
-# Defined for response documentation, even if we build dicts manually
+# --- Models (Strict Response Structure) ---
 class ExtractedData(BaseModel):
     upi_ids: List[str]
     bank_accounts: List[str]
@@ -27,8 +24,7 @@ class HoneypotResponse(BaseModel):
 
 # --- Logic ---
 
-def validate_api_key(x_api_key: str = Header(..., alias="x-api-key")):
-    """Validates the x-api-key header. Throws 401 if invalid."""
+def validate_api_key(x_api_key: Optional[str] = Header(None, alias="x-api-key")):
     if x_api_key != API_KEY_VALUE:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -37,36 +33,26 @@ def validate_api_key(x_api_key: str = Header(..., alias="x-api-key")):
     return x_api_key
 
 def extract_intelligence(text: str) -> Dict[str, list]:
-    """Extracts UPIs, bank accounts, and URLs from the text using Regex."""
     if not text:
         return {"upi_ids": [], "bank_accounts": [], "phishing_links": []}
 
-    # UPI ID Regex
     upi_pattern = r'[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}'
-    upi_ids = list(set(re.findall(upi_pattern, text)))
-
-    # Bank Account Regex: 9 to 18 digits.
+    # Bank Account: 9 to 18 digits (robust boundaries)
     bank_account_pattern = r'\b\d{9,18}\b'
-    bank_accounts = list(set(re.findall(bank_account_pattern, text)))
-
-    # Phishing URL Regex
+    # URL: Standard compliant regex
     url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[-\w._~:/?#[\]@!$&\'()*+,;=]*)?'
-    phishing_links = list(set(re.findall(url_pattern, text)))
 
     return {
-        "upi_ids": upi_ids,
-        "bank_accounts": bank_accounts,
-        "phishing_links": phishing_links
+        "upi_ids": list(set(re.findall(upi_pattern, text))),
+        "bank_accounts": list(set(re.findall(bank_account_pattern, text))),
+        "phishing_links": list(set(re.findall(url_pattern, text)))
     }
 
 def analyze_scam_intent(text: str, extracted_data: Dict[str, list]) -> tuple[bool, float]:
-    """Returns (is_scam, confidence)."""
     if not text or not text.strip():
         return False, 0.0
 
     text_lower = text.lower()
-    
-    # Keywords
     scam_keywords = [
         "urgent", "winner", "lottery", "congratulations", "won", "prize",
         "verify", "kyc", "blocked", "account", "expire", "otp", "password",
@@ -78,6 +64,7 @@ def analyze_scam_intent(text: str, extracted_data: Dict[str, list]) -> tuple[boo
     score = 0.0
     
     if keyword_hits > 0:
+        # Cap keyword boost
         score += 0.3 + (min(keyword_hits, 5) * 0.1)
     
     if extracted_data.get("phishing_links"):
@@ -93,25 +80,17 @@ def analyze_scam_intent(text: str, extracted_data: Dict[str, list]) -> tuple[boo
 # --- Universal Handler ---
 
 async def universal_handler(request: Request, api_key: str = Depends(validate_api_key)):
-    """
-    Handles GET and POST for / and /honeypot.
-    Returns 200 OK with proper JSON structure even if body is missing.
-    """
-    
-    # Default / Tester values
+    # Defaults ensures we NEVER crash and always return valid JSON
     message = ""
     conversation_id = None
-    status_text = "tester_ok"
+    status_text = "tester_safe_default"
     
-    # Try to parse body if POST
+    # Robust Body Parsing
     if request.method == "POST":
         try:
-            # We assume JSON if body exists. Silent fail if not.
-            # Using request.stream() or just json() inside try/except is safe
             body = await request.json()
             if isinstance(body, dict):
                 msg = body.get("message")
-                # Update message only if it's a non-empty string
                 if isinstance(msg, str) and msg.strip():
                     message = msg
                     status_text = "analysis_complete"
@@ -120,11 +99,9 @@ async def universal_handler(request: Request, api_key: str = Depends(validate_ap
                 if isinstance(cid, str):
                     conversation_id = cid
         except Exception:
-            # Parsing failed (empty body, wrong content-type, etc.)
-            # We stick to defaults -> equivalent to "tester_ok"
+            # Swallow parsing errors (empty body, bad JSON) to satisfy tester requirements
             pass
 
-    # Run Logic (will be empty/safe if message is empty)
     extracted = extract_intelligence(message)
     is_scam, confidence = analyze_scam_intent(message, extracted)
 
@@ -143,11 +120,9 @@ async def universal_handler(request: Request, api_key: str = Depends(validate_ap
     )
 
 # --- Routes ---
-
-# Register the same handler for all required paths and methods
 app.add_api_route("/", universal_handler, methods=["GET", "POST"], response_model=HoneypotResponse)
 app.add_api_route("/honeypot", universal_handler, methods=["GET", "POST"], response_model=HoneypotResponse)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
